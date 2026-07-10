@@ -1,0 +1,11 @@
+.opencode
+.claude
+/target
+info.json
+role*.json
+evotowerinfo.json
+state.json
+server_list.json
+/logs
+/bins
+*.bin
