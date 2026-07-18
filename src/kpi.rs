@@ -26,6 +26,8 @@ const DREAM_MERCHANT_ITEMS: &[(u64, &[&str])] = &[
 const T_DEFAULT: u64 = 8000;
 const T_FIGHT: u64 = 12000;
 const T_SKINC: u64 = 5000;
+// Tower IDs encode each floor as floor * 10; floor 450 is the permanent cap.
+const TOWER_CLEAR_ID: u64 = 4500;
 
 /// encapsulation for WebSocket + game-protocol
 pub struct GameClient {
@@ -1991,6 +1993,7 @@ impl GameClient {
         let mut report = DailyTaskReport::new();
         let delay = || tokio::time::sleep(tokio::time::Duration::from_millis(500));
         let mut needs_refresh_role_info = false;
+        let mut bottle_renewed = false;
 
         // hangup
         if periodic.needs_hangup(config.hangup_threshold_hours) {
@@ -2004,26 +2007,34 @@ impl GameClient {
             debug!(target: "periodic", prefix = log_prefix, "bottle threshold reached, run smart_bottle");
             self.smart_bottle(&mut report).await;
             needs_refresh_role_info = true;
+            bottle_renewed = true;
         }
 
         // legacy
         if periodic.needs_legacy(config.legacy_interval_hours) {
             if self.level_id() > 8000 {
-                self.smart_bottle(&mut report).await;
+                if !bottle_renewed {
+                    self.smart_bottle(&mut report).await;
+                }
                 needs_refresh_role_info = true;
                 let r = self.legacy_claimhangup().await;
                 report.run_with_prefix(log_prefix, "legacy claim", &r);
+                if crate::error_codes::is_done_result(&r) {
+                    periodic.legacy_last_claim = crate::state::now_secs();
+                }
                 delay().await;
             } else {
                 report.skip_with_prefix(log_prefix, "legacy claim (level_id ≤ 8000)");
+                periodic.legacy_last_claim = crate::state::now_secs();
             }
-            periodic.legacy_last_claim = crate::state::now_secs();
         }
 
+        let mut role_info_refreshed = !needs_refresh_role_info;
         if needs_refresh_role_info {
             match self.role_getroleinfo().await {
                 Ok(info) => {
                     self.role_info = Some(info);
+                    role_info_refreshed = true;
                 }
                 Err(e) => {
                     warn!(target: "periodic", error = %e, "failed to refresh role info after periodic actions");
@@ -2031,16 +2042,8 @@ impl GameClient {
             }
         }
 
-        if let Some(ref info) = self.role_info {
-            periodic.update_hangup_from_role(info);
-            periodic.update_bottle_from_role(info);
-
-            let status = self.get_hangup_status();
-            if status.is_active && status.remaining > 3600.0 {
-                periodic.hangup_next_check = crate::state::now_secs() + status.remaining - 3600.0;
-            } else {
-                periodic.hangup_next_check = 0.0;
-            }
+        if role_info_refreshed {
+            self.update_periodic_state(periodic);
         }
 
         // tower
@@ -2072,6 +2075,32 @@ impl GameClient {
         const MAX_CLIMBS: u32 = 100;
         let delay = || tokio::time::sleep(tokio::time::Duration::from_millis(500));
         let long_delay = || tokio::time::sleep(tokio::time::Duration::from_secs(5));
+
+        if self.role_info.as_ref().map(tower_is_cleared).unwrap_or(false) {
+            periodic.tower_cleared = true;
+            periodic.tower_next_check = 0.0;
+            info!(target: "tower", "tower already fully cleared, skip");
+            return;
+        }
+
+        let _ = self.tower_getinfo().await;
+        if let Ok(info) = self.role_getroleinfo().await {
+            self.role_info = Some(info);
+        }
+        let mut energy: i64 = self.role_info.as_ref()
+            .and_then(|v| v.pointer("/role/tower/energy").or_else(|| v.pointer("/tower/energy")))
+            .and_then(|v| v.as_i64()).unwrap_or(0);
+        let mut tower_id: u64 = self.role_info.as_ref()
+            .and_then(tower_id_from_role_info)
+            .unwrap_or(0);
+
+        if tower_id >= TOWER_CLEAR_ID {
+            periodic.tower_cleared = true;
+            periodic.tower_next_check = 0.0;
+            info!(target: "tower", tower_id, "tower already fully cleared, skip");
+            return;
+        }
+
         let original_team = match self.current_team_id().await {
             Ok(id) => Some(id),
             Err(_) => None,
@@ -2083,17 +2112,6 @@ impl GameClient {
             } else { false }
         } else { false };
 
-        let _ = self.tower_getinfo().await;
-        if let Ok(info) = self.role_getroleinfo().await {
-            self.role_info = Some(info);
-        }
-        let mut energy: i64 = self.role_info.as_ref()
-            .and_then(|v| v.pointer("/role/tower/energy").or_else(|| v.pointer("/tower/energy")))
-            .and_then(|v| v.as_i64()).unwrap_or(0);
-        let mut tower_id: u64 = self.role_info.as_ref()
-            .and_then(|v| v.pointer("/role/tower/id").or_else(|| v.pointer("/tower/id")))
-            .and_then(|v| v.as_u64()).unwrap_or(0);
-
         // check the previous tower's reward
         if tower_id > 0 && tower_id % 10 == 0 {
             let reward_floor = tower_id / 10;
@@ -2101,7 +2119,9 @@ impl GameClient {
                 let r = self.tower_claimreward(reward_floor).await;
                 report.run_with_prefix(log_prefix, &format!("claim tower reward {}", reward_floor), &r);
                 delay().await;
-                let _ = self.role_getroleinfo().await;
+                if let Ok(info) = self.role_getroleinfo().await {
+                    self.role_info = Some(info);
+                }
                 energy = self.role_info.as_ref()
                     .and_then(|v| v.pointer("/role/tower/energy").or_else(|| v.pointer("/tower/energy")))
                     .and_then(|v| v.as_i64()).unwrap_or(energy);
@@ -2150,8 +2170,14 @@ impl GameClient {
                             consecutive_failures = 0;
                             continue;
                         }
-                        Some(1500020) | Some(1500010) => {
-                            info!(target: "tower", error = %e, code, "tower exhausted or cleared");
+                        Some(1500010) => {
+                            periodic.tower_cleared = true;
+                            periodic.tower_next_check = 0.0;
+                            info!(target: "tower", error = %e, code, "tower fully cleared");
+                            break;
+                        }
+                        Some(1500020) => {
+                            info!(target: "tower", error = %e, code, "tower energy exhausted");
                             break;
                         }
                         Some(200400) => {
@@ -2181,8 +2207,16 @@ impl GameClient {
             energy = self.role_info.as_ref()
                 .and_then(|v| v.pointer("/role/tower/energy").or_else(|| v.pointer("/tower/energy")))
                 .and_then(|v| v.as_i64()).unwrap_or(energy);
+            self.update_periodic_state(periodic);
         }
-        periodic.tower_next_check = crate::state::now_secs() + (10i64.saturating_sub(energy) as f64 * 1800.0);
+        if tower_id >= TOWER_CLEAR_ID {
+            periodic.tower_cleared = true;
+            periodic.tower_next_check = 0.0;
+        }
+        if !periodic.tower_cleared {
+            periodic.tower_next_check = crate::state::now_secs()
+                + (10i64.saturating_sub(energy) as f64 * 1800.0);
+        }
 
         if switched {
             let _ = self.switch_team(original_team.unwrap_or(tower_team)).await;
@@ -2492,6 +2526,14 @@ impl GameClient {
         if let Some(ref info) = self.role_info {
             periodic.update_hangup_from_role(info);
             periodic.update_bottle_from_role(info);
+
+            if tower_is_cleared(info) {
+                if !periodic.tower_cleared {
+                    info!(target: "tower", tower_id = ?tower_id_from_role_info(info), "tower clear state recorded");
+                }
+                periodic.tower_cleared = true;
+                periodic.tower_next_check = 0.0;
+            }
         }
     }
 }
@@ -2688,13 +2730,15 @@ impl DailyTaskReport {
                 if let Some(code) = crate::error_codes::extract_code_from_error(&e) {
                     if crate::error_codes::is_done_error(code) {
                         info!(target: "task", code = code, error = %e, "[~~] {}", name);
+                        self.results.push(TaskResult::Skipped(name.to_string()));
                     } else {
                         warn!(target: "task", code = code, error = %e, "[X] {}", name);
+                        self.results.push(TaskResult::Failed(name.to_string(), e));
                     }
                 } else {
                     warn!(target: "task", error = %e, "[X] {}", name);
+                    self.results.push(TaskResult::Failed(name.to_string(), e));
                 }
-                self.results.push(TaskResult::Failed(name.to_string(), e));
             }
         }
     }
@@ -2720,13 +2764,15 @@ impl DailyTaskReport {
                 if let Some(code) = crate::error_codes::extract_code_from_error(e) {
                     if crate::error_codes::is_done_error(code) {
                         info!(target: "task", code = code, error = %e, "[~~] {}", name);
+                        self.results.push(TaskResult::Skipped(name.to_string()));
                     } else {
                         warn!(target: "task", code = code, error = %e, "[X] {}", name);
+                        self.results.push(TaskResult::Failed(name.to_string(), e.clone()));
                     }
                 } else {
                     warn!(target: "task", error = %e, "[X] {}", name);
+                    self.results.push(TaskResult::Failed(name.to_string(), e.clone()));
                 }
-                self.results.push(TaskResult::Failed(name.to_string(), e.clone()));
             }
         }
     }
@@ -2945,6 +2991,17 @@ fn extract_last_login(role_resp: &Value) -> Option<i64> {
         .and_then(|v| v.as_i64())
 }
 
+fn tower_id_from_role_info(role_info: &Value) -> Option<u64> {
+    role_info
+        .pointer("/role/tower/id")
+        .or_else(|| role_info.pointer("/tower/id"))
+        .and_then(Value::as_u64)
+}
+
+fn tower_is_cleared(role_info: &Value) -> bool {
+    tower_id_from_role_info(role_info).unwrap_or(0) >= TOWER_CLEAR_ID
+}
+
 fn skinc_remaining_hp(response: &Value) -> Option<f64> {
     response
         .pointer("/battleData/result/accept/ext/curHP")
@@ -2962,7 +3019,7 @@ fn skinc_current_floor(tower_type: u64, level_reward_map: &serde_json::Map<Strin
 
 #[cfg(test)]
 mod tests {
-    use super::{skinc_current_floor, skinc_remaining_hp};
+    use super::{DailyTaskReport, skinc_current_floor, skinc_remaining_hp, tower_is_cleared};
     use serde_json::json;
 
     #[test]
@@ -2992,6 +3049,23 @@ mod tests {
         assert_eq!(skinc_current_floor(1, no_progress.as_object().unwrap()), 1);
         assert_eq!(skinc_current_floor(1, floor_three.as_object().unwrap()), 3);
         assert_eq!(skinc_current_floor(6, complete.as_object().unwrap()), 8);
+    }
+
+    #[test]
+    fn tower_clear_state_is_detected_from_role_info() {
+        assert!(!tower_is_cleared(&json!({"role": {"tower": {"id": 4499}}})));
+        assert!(tower_is_cleared(&json!({"role": {"tower": {"id": 4500}}})));
+        assert!(tower_is_cleared(&json!({"tower": {"id": 4501}})));
+    }
+
+    #[test]
+    fn done_errors_are_reported_as_skipped() {
+        let mut report = DailyTaskReport::new();
+
+        report.run_with_prefix("test", "tower reward", &Err("[200120] done".to_string()));
+
+        assert_eq!(report.skip_count(), 1);
+        assert_eq!(report.fail_count(), 0);
     }
 }
 

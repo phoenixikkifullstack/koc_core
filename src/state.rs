@@ -140,6 +140,9 @@ pub struct RolePeriodicState {
     /// tower check time (second, 0=immediately)
     #[serde(default)]
     pub tower_next_check: f64,
+    /// tower has reached the permanent clear state
+    #[serde(default)]
+    pub tower_cleared: bool,
     /// evotower check time (second, 0=immediately)
     #[serde(default)]
     pub evo_next_check: f64,
@@ -358,7 +361,7 @@ impl RolePeriodicState {
 
     /// tower check condition
     pub fn needs_tower(&self) -> bool {
-        self.tower_next_check <= 0.0 || now_secs() >= self.tower_next_check
+        !self.tower_cleared && (self.tower_next_check <= 0.0 || now_secs() >= self.tower_next_check)
     }
 
     /// evotower check condition
@@ -378,6 +381,14 @@ impl RolePeriodicState {
             if let Some(v) = obj.get("hangUpTime").and_then(|v| v.as_f64()) {
                 self.hangup_time = v;
             }
+
+            let now = now_secs();
+            let remaining = self.hangup_time - (now - self.hangup_last_time);
+            self.hangup_next_check = if self.hangup_last_time > 0.0 && remaining > 3600.0 {
+                now + remaining - 3600.0
+            } else {
+                0.0
+            };
         }
     }
 
@@ -408,4 +419,66 @@ pub type SharedState = Arc<RwLock<AppState>>;
 /// new shared state
 pub fn new_shared_state(state: AppState) -> SharedState {
     Arc::new(RwLock::new(state))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RolePeriodicState, now_secs};
+    use serde_json::json;
+
+    #[test]
+    fn cleared_tower_never_needs_another_check() {
+        let state = RolePeriodicState {
+            tower_next_check: 0.0,
+            tower_cleared: true,
+            ..Default::default()
+        };
+
+        assert!(!state.needs_tower());
+    }
+
+    #[test]
+    fn legacy_periodic_state_defaults_tower_to_not_cleared() {
+        let state: RolePeriodicState =
+            serde_json::from_str(r#"{"tower_next_check":12345.0}"#).unwrap();
+
+        assert!(!state.tower_cleared);
+        assert_eq!(state.tower_next_check, 12345.0);
+    }
+
+    #[test]
+    fn tower_clear_state_survives_serialization() {
+        let state = RolePeriodicState {
+            tower_cleared: true,
+            ..Default::default()
+        };
+
+        let encoded = serde_json::to_string(&state).unwrap();
+        let decoded: RolePeriodicState = serde_json::from_str(&encoded).unwrap();
+
+        assert!(decoded.tower_cleared);
+    }
+
+    #[test]
+    fn refreshed_role_state_defers_bottle_and_hangup_checks() {
+        let now = now_secs();
+        let mut state = RolePeriodicState {
+            bottle_stop_time: now + 1800.0,
+            ..Default::default()
+        };
+        assert!(state.needs_bottle(1.0));
+
+        let refreshed = json!({
+            "role": {
+                "bottleHelpers": {"helperStopTime": now + 8.0 * 3600.0},
+                "hangUp": {"lastTime": now, "hangUpTime": 12.0 * 3600.0}
+            }
+        });
+        state.update_bottle_from_role(&refreshed);
+        state.update_hangup_from_role(&refreshed);
+
+        assert!(!state.needs_bottle(1.0));
+        assert!(state.hangup_next_check > now + 10.0 * 3600.0);
+        assert!(!state.needs_hangup(8.0));
+    }
 }

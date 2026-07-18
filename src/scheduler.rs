@@ -250,12 +250,25 @@ impl RoleRunner {
             ).await;
             info!(target: "scheduler", phase = "daily", summary = %report.summary(), "daily tasks finished");
 
+            let periodic_state_refreshed = match game.role_getroleinfo().await {
+                Ok(info) => {
+                    game.role_info = Some(info);
+                    true
+                }
+                Err(e) => {
+                    warn!(target: "scheduler", phase = "daily", error = %e, "failed to refresh periodic state after daily actions");
+                    false
+                }
+            };
+
             // write back to state
             {
                 let mut st = self.state.write().await;
                 let rs = st.get_or_create(&role_task.key);
                 rs.daily = daily_state;
-                game.update_periodic_state(&mut rs.periodic);
+                if periodic_state_refreshed {
+                    game.update_periodic_state(&mut rs.periodic);
+                }
                 let _ = st.save(&self.state_path);
             }
         }
