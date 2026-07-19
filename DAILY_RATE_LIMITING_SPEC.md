@@ -1,0 +1,350 @@
+# Daily Scheduling and Rate-Limit Recovery Specification
+
+Status: Proposed
+
+## Summary
+
+The batch scheduler must treat all roles loaded from the same bin file as one account-level traffic domain. Only one role from a bin may execute at a time, while roles from different bins may continue to run concurrently. A configurable cooldown must separate consecutive roles from the same bin.
+
+Daily reward claiming must also become recoverable. A rate-limit response, transport failure, or timeout must not be persisted as successful completion. The scheduler must stop sending reward commands after a rate-limit response, apply account-level backoff, and retry only unsettled reward work later.
+
+## Context
+
+The current implementation has four relevant behaviors:
+
+1. `Scheduler::execute_round` applies only a global semaphore. Roles from the same bin can execute concurrently.
+2. `delay_between_ms` delays task submission, not the start of a role after the previous role from the same bin has completed. Tasks waiting on the semaphore may start immediately after a permit is released.
+3. The stateful daily flow sends reward commands at 500 ms intervals and unconditionally sets `daily.task_rewards = true`, even if one or more reward commands failed.
+4. Daily task completion uses IDs `1, 2, 3, 4, 5, 6, 7, 12, 13, 14`, but the reward loop currently submits point claims for `1..=10`. This submits IDs `8, 9, 10` and omits IDs `12, 13, 14`. The exact server behavior must be confirmed, but the implementation must use one canonical task-ID list.
+
+These behaviors can produce overlapping account traffic, bursty reward claims, missing task points, and false local completion after server throttling.
+
+## Goals
+
+- Guarantee at most one active role per bin.
+- Preserve concurrency across different bins.
+- Enforce a cooldown between consecutive roles from the same bin.
+- Slow and settle the daily reward phase without adding arbitrary delays to unrelated scheduler work.
+- Treat error code `200400`, timeouts, and connection failures as retryable.
+- Stop a reward batch immediately when the server rate-limits the account.
+- Persist reward progress so successful claims are not unnecessarily repeated.
+- Retry only pending work after backoff.
+- Make rate-limit behavior visible in structured logs without exposing bin contents, decoded credentials, or tokens.
+- Preserve existing configurations and persisted state through serde defaults or an explicit migration.
+
+## Non-Goals
+
+- Discovering the server's exact undocumented quota.
+- Running automated live-account traffic as part of tests.
+- Changing combat, tower, study, periodic-task, or vehicle semantics except where they must respect an active bin-level backoff.
+- Coordinating limits across multiple independent `koc_batch` processes. Operators must continue to run only one scheduler for a given set of bins.
+- Treating the existing HTTP `RateLimiter` as the solution. It is instance-local and currently records requests without delaying or rejecting them.
+
+## Terminology
+
+- **Bin**: A configured authentication input and the account-level rate-limit domain.
+- **Role**: One game character selected from a bin by `server_id`.
+- **Bin lane**: The ordered queue of pending roles belonging to one normalized bin path.
+- **Settled outcome**: Success or a command-specific terminal response that requires no retry for the current daily cycle.
+- **Retryable outcome**: A rate limit, timeout, disconnection, or transient server failure.
+
+## Functional Requirements
+
+### FR-1: Per-Bin Serialization
+
+- The scheduler must partition each round's `RoleRunPlan` values by normalized `bin_path`.
+- Plans inside a bin lane must retain their existing order.
+- A bin lane must execute no more than one role at a time.
+- Different bin lanes may execute concurrently up to the existing global `concurrency` value.
+- Token selection, login, daily work, weekly work, periodic work, and disconnect are all part of the active role interval.
+- A failed token request or login still counts as an account attempt and must be followed by the bin cooldown.
+
+### FR-2: Semaphore and Cooldown Semantics
+
+- A bin lane must acquire the global semaphore immediately before running a role.
+- The global semaphore permit must be released immediately after that role finishes.
+- The bin lane must not hold a global permit while waiting for its cooldown or backoff deadline.
+- The cooldown starts when the previous role attempt finishes, not when it was submitted or started.
+- A bounded random jitter must be added to the cooldown to prevent synchronized scheduler instances or rounds from producing identical traffic patterns.
+
+### FR-3: Daily Command Pacing
+
+- The hard-coded 500 ms daily action delay must become configurable.
+- Reward commands must use the configured delay between completed request/response exchanges.
+- Heartbeats must not consume the daily command pacing budget.
+- Response wait time is not a substitute for the configured delay.
+- The initial implementation may apply pacing in the daily orchestrator. A shared outbound command pacer may replace it later if nested command flows still produce bursts.
+
+### FR-4: Reward Settlement
+
+- Before claiming task points, the client must wait for the configured settlement delay.
+- The client must refresh role information with `role_getroleinfo` and update `GameClient::role_info` before deciding which daily task points are claimable.
+- Daily task IDs must come from one canonical constant:
+
+  ```text
+  [1, 2, 3, 4, 5, 6, 7, 12, 13, 14]
+  ```
+
+- The reward flow must not use `1..=10` as a substitute for the canonical IDs.
+- A point claim should be sent only when refreshed server state reports that task as complete and local reward state does not already mark the point claim as settled.
+- Daily, weekly, and war-order rewards must have independent completion state.
+- A technical failure in one reward category must not erase successful progress in another category.
+
+### FR-5: Rate-Limit Handling
+
+- Error code `200400` must be classified as retryable, never as done.
+- On the first `200400` in a reward batch, the client must:
+  1. Record the failed command and error code.
+  2. Stop sending the remaining reward commands.
+  3. Leave the failed and unattempted reward items pending.
+  4. Set a backoff deadline for the entire bin.
+  5. Disconnect normally when control returns to the role runner.
+- A timeout or WebSocket disconnection during reward claiming must follow the same pending-state behavior. It may use the first backoff tier unless a more specific connection policy exists.
+- The scheduler must not retry the same bin before its backoff deadline.
+- A rate limit encountered outside the reward phase should also set the bin backoff deadline when the error reaches the role runner.
+
+### FR-6: Backoff Policy
+
+- Backoff must be account-level, keyed by normalized bin path.
+- The default retry schedule must be 5 minutes, 15 minutes, and 30 minutes for consecutive rate-limit events.
+- Each delay must include bounded random jitter.
+- A role run with no rate-limit or retryable failure resets the bin's consecutive rate-limit counter.
+- Exhausting the configured tiers must not mark pending rewards as complete. Later attempts continue using the final tier and emit a warning.
+- `max_daily_retries` must not cause silent reward loss. It may control warning escalation, but pending rewards remain pending until settled or the daily state resets.
+
+### FR-7: Completion Semantics
+
+- `RoleDailyState::all_done()` must return false while a retryable reward item remains pending.
+- `daily.task_rewards` must never be set unconditionally after a best-effort loop.
+- Success and error code `700020` (already claimed) settle an individual task-point claim.
+- Error code `700010` (conditions not met) is not a rate-limit response. For a task reported complete by refreshed server state, it remains pending and is retried after settlement backoff. For a task not reported complete, no claim should be sent.
+- Command-specific "nothing available" responses for weekly or war-order rewards may settle that category for the current day, but they must not be added to a universal done-code policy without command context.
+- Error code `12400000` describes an account cooldown and must not be treated as universal successful completion. Its handling should remain command-specific.
+
+### FR-8: Reward-Only Retry
+
+- When all non-reward daily fields are complete and only reward state is pending, the next run must execute a reward-only path.
+- A reward-only retry must not rerun `smart_hangup`, `smart_bottle`, combat, purchases, gacha, or other already-completed daily actions.
+- The reward-only path must perform settlement delay, refresh role information, and attempt only pending reward items.
+- Periodic and weekly planning must remain independently controlled by their existing state.
+
+### FR-9: CLI Behavior
+
+- `koc_cli daily --group` and `koc_cli daily --force-all` must serialize roles from the same bin and apply the same inter-role cooldown.
+- A single-role CLI run must use reward pacing and correct completion classification.
+- Because CLI daily state is in memory, unresolved reward failures must be included in the final summary and cause the single-role command to return an error.
+- Multi-role CLI mode may continue to the next role after an error, but its final result must report that one or more roles failed.
+
+## Proposed Scheduler Design
+
+`PendingPlanner` continues to decide whether each role needs daily, periodic, or weekly work. `execute_round` then groups the plans into FIFO bin lanes.
+
+Conceptual flow:
+
+```text
+collect pending plans
+group plans by normalized bin path, preserving order
+spawn one worker per bin lane
+
+for each lane worker:
+    for each role plan:
+        wait until max(next_role_at, bin backoff deadline)
+        acquire global role semaphore
+        run the role plan
+        release global role semaphore
+        update bin rate-limit state from the run outcome
+        set next_role_at = finish time + cooldown + jitter
+
+join all lane workers
+persist state
+```
+
+`RoleRunner::run_one` should return a structured outcome instead of `()`:
+
+```rust
+struct RoleRunOutcome {
+    rate_limited: bool,
+    retryable_failure: bool,
+}
+```
+
+The exact type may carry the error code and phase for logging, but it must not contain credentials or token data.
+
+## Proposed State Model
+
+Replace the aggregate reward boolean with granular state conceptually equivalent to:
+
+```rust
+struct DailyRewardState {
+    settled_task_points: BTreeSet<u32>,
+    daily_reward: bool,
+    weekly_reward: bool,
+    war_order_reward: bool,
+    retry_count: u32,
+    next_retry_at: f64,
+}
+```
+
+Persist bin-level backoff separately from role state:
+
+```rust
+struct BinRateLimitState {
+    consecutive_events: u32,
+    next_allowed_at: f64,
+}
+```
+
+The persisted bin key must be the same normalized path used by scheduler lanes. Bin state must never include raw bin bytes, decoded fields, or tokens.
+
+### State Migration
+
+- Existing `state.json` files containing `task_rewards: true` must migrate to all reward categories settled for that date.
+- Existing `task_rewards: false` or a missing field must migrate to the default granular state.
+- Missing bin-level backoff state defaults to no active backoff.
+- New fields must use serde defaults so older state files remain readable.
+- The migrated representation should be written on the next normal state save.
+
+## Configuration
+
+Add the following top-level settings with serde defaults:
+
+```yaml
+# Minimum delay after one role from a bin finishes before the next role starts.
+same_bin_role_cooldown_secs: 30
+
+# Random value in [0, value] added to the same-bin cooldown.
+same_bin_role_jitter_secs: 10
+
+# Delay between daily action and reward request/response exchanges.
+daily_command_interval_ms: 1000
+
+# Delay before refreshing task state and claiming rewards.
+reward_settle_delay_secs: 5
+
+# Consecutive account-level rate-limit backoff tiers.
+rate_limit_backoff_secs: [300, 900, 1800]
+
+# Random value in [0, value] added to a rate-limit backoff.
+rate_limit_backoff_jitter_secs: 30
+```
+
+Existing settings retain these meanings:
+
+- `concurrency` is the maximum number of actively running roles across different bins.
+- `delay_between_ms` remains a general lane-launch pacing setting for compatibility, but it is not a rate-limit guarantee and must not replace same-bin cooldown.
+- Configuration hot reload applies new values starting with the next scheduler round. An already-running role keeps the policy snapshot with which it started.
+
+Validation requirements:
+
+- `concurrency` must be at least 1.
+- Delay and jitter values may be zero for controlled testing.
+- `rate_limit_backoff_secs` must contain at least one positive value.
+
+## Outcome Classification
+
+| Outcome | Classification | Persist as settled | Continue reward batch |
+| --- | --- | --- | --- |
+| Successful response | Settled | Yes | Yes |
+| `700020` already claimed | Settled | Yes | Yes |
+| `200400` action too quickly | Retryable rate limit | No | No |
+| Request timeout | Retryable transport failure | No | No |
+| WebSocket disconnected | Retryable transport failure | No | No |
+| `700010` after server reports task complete | Deferred settlement | No | No |
+| Task not complete in refreshed state | Not attempted | No | Yes |
+| Command-specific permanent/not-applicable response | Settled for that category and day | Yes | Yes |
+
+The implementation should use typed outcome classification or extracted numeric codes. It must not depend on matching translated error text.
+
+## Observability
+
+Structured logs must include:
+
+- Normalized bin identifier and role display name.
+- Scheduler phase and command name.
+- Outcome classification and numeric error code when available.
+- Cooldown or backoff duration.
+- Retry attempt and next eligible timestamp.
+- Reward summary counts: settled, pending, skipped, and failed.
+
+Logs must not include raw bin bytes, decoded bin values, login tokens, or complete server responses that may contain credentials.
+
+Recommended events:
+
+```text
+bin lane started
+role waiting for same-bin cooldown
+role waiting for bin rate-limit backoff
+reward settlement refresh started
+reward batch rate limited
+reward-only retry scheduled
+bin rate-limit state reset after success
+```
+
+## Testing Strategy
+
+No test may connect to a live game account.
+
+### Unit Tests
+
+- Plans from the same bin never overlap.
+- Plans from different bins can overlap up to global `concurrency`.
+- A lane waiting for cooldown does not hold a global semaphore permit.
+- Cooldown is measured from role completion.
+- Jitter stays within its configured bound using deterministic randomness or an injectable source.
+- The canonical daily task-ID list contains exactly `1, 2, 3, 4, 5, 6, 7, 12, 13, 14`.
+- `200400` stops the reward batch and leaves failed and unattempted items pending.
+- Timeout and disconnect outcomes leave reward items pending.
+- Success and `700020` settle only the relevant item.
+- `all_done()` remains false while retryable reward state is pending.
+- Reward-only retry does not invoke completed daily actions.
+- Backoff advances through 5, 15, and 30 minute tiers and remains at the final tier.
+- A successful non-rate-limited role resets consecutive bin rate-limit state.
+- Legacy boolean reward state migrates without losing a previously completed day.
+
+### Scheduler Tests With Fakes
+
+- Use a fake role executor, fake clock, and deterministic jitter source.
+- Verify FIFO order within each bin lane.
+- Verify that one slow bin does not block unrelated bins beyond the global concurrency limit.
+- Verify that a rate limit in one role delays the next role from the same bin but not roles from other bins.
+- Verify persisted backoff is respected after scheduler reconstruction.
+
+### Repository Verification
+
+Run:
+
+```bash
+cargo test
+cargo check --all-targets
+```
+
+Live verification, if performed manually by an operator, must use one explicitly selected role first. The batch daemon must not be started as a narrow test because its first round force-runs configured roles.
+
+## Rollout Plan
+
+1. Add pure outcome classification and canonical task-ID tests.
+2. Add granular reward state and migration.
+3. Implement reward settlement refresh, pacing, abort-on-rate-limit, and reward-only retry.
+4. Implement per-bin scheduler lanes, cooldown, jitter, and persisted bin backoff.
+5. Apply the same same-bin policy to multi-role CLI daily execution.
+6. Deploy with conservative defaults and inspect structured rate-limit logs for several daily cycles.
+7. Tune cooldown and pacing based on observed `200400` frequency. Do not reduce defaults until multiple cycles complete without throttling.
+
+## Acceptance Criteria
+
+- Two roles from the same bin are never active simultaneously.
+- Roles from different bins still run concurrently.
+- At least the configured cooldown separates same-bin role attempts.
+- Daily point claims use the canonical task IDs and refreshed server completion state.
+- A `200400`, timeout, or disconnect cannot result in the affected reward being persisted as complete.
+- No reward commands are sent after a `200400` in the same reward batch.
+- The next role from a rate-limited bin waits for account-level backoff.
+- A later scheduler round can run a reward-only retry without repeating completed daily actions.
+- Existing config and state files load successfully.
+- `cargo test` and `cargo check --all-targets` pass.
+
+## Open Questions
+
+- Confirm from captured non-sensitive responses that `task_claimdailypoint.taskId` uses the same IDs as `dailyTask.complete`. The current code strongly implies this, but it should be verified before live rollout.
+- Identify command-specific terminal codes for daily, weekly, and war-order reward claims. These classifications should not be inferred from the global done-code list.
+- Determine whether server throttling is keyed only by account/bin identity or also by IP. The proposed design solves account bursts but cannot coordinate multiple hosts sharing one public IP.
