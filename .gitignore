@@ -7,5 +7,6 @@ evotowerinfo.json
 state.json
 server_list.json
 /logs
-/bins
-*.bin
+/capture
+/captures
+koc_batch

@@ -14,10 +14,12 @@ pub mod hortor_crypto;
 pub mod wx_login;
 pub mod logging;
 pub mod study;
+pub mod proxy_capture;
+pub mod proxy;
 
-pub use bon::{DataReader, DataWriter, BonEncoder, BonDecoder};
-pub use crypto::{XorCrypto, Lz4Crypto, get_encryptor, Encryptor, auto_decrypt};
-pub use protocol::{ProtoMsg, parse_message, create_message};
+pub use bon::{BonDecodeLimits, BonDecoder, BonEncoder, DataReader, DataWriter};
+pub use crypto::{XorCrypto, Lz4Crypto, get_encryptor, Encryptor, auto_decrypt, try_auto_decrypt};
+pub use protocol::{ProtoMsg, parse_message, parse_message_limited, create_message};
 pub use http_client::HttpClient;
 pub use websocket::WebSocketClient;
 pub use kpi::GameClient;
@@ -64,7 +66,9 @@ impl KocCore {
         let msg = protocol::parse_message(&response)?;
 
         // body is BON-encoded binary, decode it
-        let body_data = msg.raw_data().ok_or("Failed to decode body")?;
+        let body_data = msg
+            .raw_data_result()?
+            .ok_or("Failed to decode body")?;
         let mut data = match body_data {
             Value::Object(obj) => obj,
             _ => msg.get_data().clone(),
@@ -86,7 +90,9 @@ impl KocCore {
         let msg = protocol::parse_message(&response)?;
 
         // body is BON-encoded binary, decode it
-        let body_data = msg.raw_data().ok_or("Failed to decode body")?;
+        let body_data = msg
+            .raw_data_result()?
+            .ok_or("Failed to decode body")?;
         let data = body_data.as_object().ok_or("Body is not an object")?;
 
         let mut roles = Vec::new();

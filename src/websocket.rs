@@ -22,8 +22,29 @@ pub struct WebSocketClient {
 impl WebSocketClient {
     /// Build the game WebSocket URL from a token JSON string
     pub fn build_url(token_json: &str) -> String {
-        let encoded = urlencoding::encode(token_json);
-        format!("wss://xxz-xyzw.hortorgames.com/agent?p={}&e=x&lang=chinese", encoded)
+        Self::build_url_with_base(token_json, "wss://xxz-xyzw.hortorgames.com")
+            .expect("default WebSocket base URL is valid")
+    }
+
+    /// Build a game WebSocket URL using an alternate origin, such as a local relay.
+    pub fn build_url_with_base(token_json: &str, base_url: &str) -> Result<String, String> {
+        let mut url = url::Url::parse(base_url)
+            .map_err(|e| format!("invalid WebSocket base URL: {}", e))?;
+        if !matches!(url.scheme(), "ws" | "wss") {
+            return Err("WebSocket base URL must use ws:// or wss://".to_string());
+        }
+        if url.host_str().is_none() || !url.username().is_empty() || url.password().is_some() {
+            return Err("WebSocket base URL must be an origin without credentials".to_string());
+        }
+        if url.query().is_some() || url.fragment().is_some() {
+            return Err("WebSocket base URL must not contain a query or fragment".to_string());
+        }
+        url.set_path("/agent");
+        url.query_pairs_mut()
+            .append_pair("p", token_json)
+            .append_pair("e", "x")
+            .append_pair("lang", "chinese");
+        Ok(url.into())
     }
 
     /// Connect to the game WebSocket server
@@ -192,5 +213,22 @@ impl WebSocketClient {
             h.abort();
         }
         let _ = self.sender.send(Vec::new()).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn builds_relay_url_without_losing_token_json() {
+        let token = r#"{"sessId":1,"name":"a b"}"#;
+        let url = WebSocketClient::build_url_with_base(token, "ws://127.0.0.1:8787").unwrap();
+        let parsed = url::Url::parse(&url).unwrap();
+        assert_eq!(parsed.scheme(), "ws");
+        assert_eq!(parsed.path(), "/agent");
+        let query: std::collections::HashMap<_, _> = parsed.query_pairs().into_owned().collect();
+        assert_eq!(query.get("p").map(String::as_str), Some(token));
+        assert_eq!(query.get("e").map(String::as_str), Some("x"));
     }
 }

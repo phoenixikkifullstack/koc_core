@@ -81,21 +81,17 @@ impl DataReader {
 
     pub fn read_7bit_int(&mut self) -> Option<u32> {
         let mut value: u32 = 0;
-        let mut shift = 0;
-        let mut count = 0;
-        loop {
-            if count > 35 {
+        for index in 0..5 {
+            let b = self.read_u8()?;
+            if index == 4 && (b & 0xf0) != 0 {
                 return None;
             }
-            let b = self.read_u8()?;
-            value |= ((b & 0x7f) as u32) << shift;
-            shift += 7;
+            value |= ((b & 0x7f) as u32) << (index * 7);
             if (b & 0x80) == 0 {
-                break;
+                return Some(value);
             }
-            count += 1;
         }
-        Some(value)
+        None
     }
 
     pub fn read_utf(&mut self) -> Option<String> {
@@ -272,23 +268,76 @@ impl BonEncoder {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct BonDecodeLimits {
+    pub max_depth: usize,
+    pub max_collection_items: usize,
+    pub max_value_bytes: usize,
+    pub max_total_nodes: usize,
+    pub max_total_value_bytes: usize,
+}
+
+impl BonDecodeLimits {
+    pub const fn proxy() -> Self {
+        Self {
+            max_depth: 64,
+            max_collection_items: 100_000,
+            max_value_bytes: 16 * 1024 * 1024,
+            max_total_nodes: 200_000,
+            max_total_value_bytes: 32 * 1024 * 1024,
+        }
+    }
+}
+
+impl Default for BonDecodeLimits {
+    fn default() -> Self {
+        Self {
+            max_depth: 128,
+            max_collection_items: 1_000_000,
+            max_value_bytes: 64 * 1024 * 1024,
+            max_total_nodes: 2_000_000,
+            max_total_value_bytes: 256 * 1024 * 1024,
+        }
+    }
+}
+
 pub struct BonDecoder {
     dr: DataReader,
     str_arr: Vec<String>,
+    limits: BonDecodeLimits,
+    nodes_remaining: usize,
+    value_bytes_remaining: usize,
 }
 
 impl BonDecoder {
     pub fn new() -> Self {
+        Self::with_limits(BonDecodeLimits::default())
+    }
+
+    pub fn with_limits(limits: BonDecodeLimits) -> Self {
         Self {
             dr: DataReader::new(Vec::new()),
             str_arr: Vec::new(),
+            limits,
+            nodes_remaining: limits.max_total_nodes,
+            value_bytes_remaining: limits.max_total_value_bytes,
         }
     }
     pub fn reset(&mut self, data: Vec<u8>) {
         self.dr.reset(data);
         self.str_arr.clear();
+        self.nodes_remaining = self.limits.max_total_nodes;
+        self.value_bytes_remaining = self.limits.max_total_value_bytes;
     }
     pub fn decode(&mut self) -> Option<Value> {
+        self.decode_at(0)
+    }
+
+    fn decode_at(&mut self, depth: usize) -> Option<Value> {
+        if depth > self.limits.max_depth {
+            return None;
+        }
+        self.nodes_remaining = self.nodes_remaining.checked_sub(1)?;
         let tag = self.dr.read_u8()?;
         match tag {
             0 => Some(Value::Null),
@@ -311,41 +360,58 @@ impl BonDecoder {
                     .unwrap_or(Value::Null)
             }),
             5 => {
-                let s = self.dr.read_utf()?;
+                let len = self.dr.read_7bit_int()? as usize;
+                if len > self.limits.max_value_bytes {
+                    return None;
+                }
+                self.value_bytes_remaining = self.value_bytes_remaining.checked_sub(len)?;
+                let s = self.dr.read_utf_bytes(len)?;
                 self.str_arr.push(s.clone());
                 Some(Value::String(s))
             }
             6 => self.dr.read_u8().map(|v| Value::Bool(v == 1)),
             7 => {
                 let len = self.dr.read_7bit_int()? as usize;
+                if len > self.limits.max_value_bytes {
+                    return None;
+                }
+                self.value_bytes_remaining = self.value_bytes_remaining.checked_sub(len)?;
                 self.dr
                     .read_bytes(len)
                     .map(|v| Value::String(base64::encode(&v)))
             }
             8 => {
                 let count = self.dr.read_7bit_int()? as usize;
+                if count > self.limits.max_collection_items {
+                    return None;
+                }
                 let mut obj = serde_json::Map::new();
                 for _ in 0..count {
-                    let k = match self.decode()? {
+                    let k = match self.decode_at(depth + 1)? {
                         Value::String(s) => s,
                         other => format!("{}", other),
                     };
-                    let v = self.decode()?;
+                    let v = self.decode_at(depth + 1)?;
                     obj.insert(k, v);
                 }
                 Some(Value::Object(obj))
             }
             9 => {
                 let len = self.dr.read_7bit_int()? as usize;
+                if len > self.limits.max_collection_items {
+                    return None;
+                }
                 let mut arr = Vec::with_capacity(len);
                 for _ in 0..len {
-                    arr.push(self.decode()?);
+                    arr.push(self.decode_at(depth + 1)?);
                 }
                 Some(Value::Array(arr))
             }
             99 => {
                 let idx = self.dr.read_7bit_int()? as usize;
-                self.str_arr.get(idx).cloned().map(Value::String)
+                let value = self.str_arr.get(idx)?;
+                self.value_bytes_remaining = self.value_bytes_remaining.checked_sub(value.len())?;
+                Some(Value::String(value.clone()))
             }
             10 => {
                 // DateTime: read i64 timestamp (ms since epoch)
@@ -367,7 +433,10 @@ pub fn encode(value: &Value) -> Vec<u8> {
     enc.get_bytes()
 }
 pub fn decode(data: &[u8]) -> Option<Value> {
-    let mut dec = BonDecoder::new();
+    decode_with_limits(data, BonDecodeLimits::default())
+}
+pub fn decode_with_limits(data: &[u8], limits: BonDecodeLimits) -> Option<Value> {
+    let mut dec = BonDecoder::with_limits(limits);
     dec.reset(data.to_vec());
     dec.decode()
 }
@@ -430,5 +499,16 @@ mod base64 {
             }
         }
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_overwide_7bit_integer_without_panicking() {
+        let mut reader = DataReader::new(vec![0xff, 0xff, 0xff, 0xff, 0xff, 0x00]);
+        assert_eq!(reader.read_7bit_int(), None);
     }
 }

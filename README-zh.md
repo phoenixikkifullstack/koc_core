@@ -13,6 +13,8 @@ koc_core/
 │   ├── protocol.rs         # 游戏消息协议 (ProtoMsg 解析/创建)
 │   ├── http_client.rs      # HTTP 客户端 (authuser / serverlist)
 │   ├── websocket.rs        # WebSocket 客户端 (心跳, 请求/响应匹配)
+│   ├── proxy.rs            # 实时 WebSocket payload 保真 relay
+│   ├── proxy_capture.rs    # Capture schema、实时解析、关联和命令目录
 │   ├── kpi.rs              # 高层Api (登录, 155个游戏命令, 每日/周期任务)
 │   ├── error_codes.rs      # 游戏错误码映射 + is_done_error 判定
 │   ├── config.rs           # 配置文件解析 (YAML) + ConfigWatcher 热加载
@@ -23,7 +25,8 @@ koc_core/
 │   ├── logging.rs          # tracing 日志初始化 (console + 文件)
 │   ├── koc_batch.rs        # [bin] 批量每日任务调度器 CLI
 │   ├── token_gen.rs        # [bin] Token/Bin 文件生成工具 CLI
-│   └── koc_cli.rs          # [bin] 手动任务验证 CLI (verify/study/tower/evotower/monthly/car/skinc)
+│   ├── koc_cli.rs          # [bin] 手动任务验证 CLI (verify/study/tower/evotower/monthly/car/skinc)
+│   └── koc_proxy.rs        # [bin] 实时协议 relay 和 capture inspector
 ├── run_koc_tasks.ps1       # 综合任务交互执行脚本
 ├── run_koc_cli.ps1         # 全新双层菜单交互脚本
 ├── examples/
@@ -48,6 +51,9 @@ cargo build --release --bin koc_batch
 
 # 只编译 token 生成工具
 cargo build --release --bin token_gen
+
+# 只编译实时协议代理
+cargo build --release --bin koc_proxy
 
 # 只编译手动验证工具
 cargo build --release --bin koc_cli
@@ -463,6 +469,73 @@ Options:
 - 默认级别 `info`，可通过环境变量调节：`RUST_LOG=debug ./koc_batch`
 - 文件日志目录：`logs/`（按天滚动）
 
+## 工具四: koc_proxy - 实时协议解析
+
+`koc_proxy` 会原样转发 WebSocket 消息，同时将每个 Binary message 的副本交给现有 XOR/LZ4/BON 协议栈实时解析。解析失败不会修改或阻塞游戏流量。Relay 仅允许监听 loopback 地址，也不会记录 WebSocket 握手中的认证 query。
+
+启动实时 relay，并可选保存原始记录和命令目录：
+
+```bash
+cargo run --bin koc_proxy -- relay \
+  --listen 127.0.0.1:8787 \
+  --decode \
+  --record captures/session.jsonl \
+  --catalog captures/catalog.json
+```
+
+在另一个终端将本项目的 WebSocket 客户端指向 relay。Token 仍由正常登录流程传递，不会出现在命令行参数中：
+
+```bash
+KOC_WS_BASE_URL=ws://127.0.0.1:8787 \
+  cargo run --bin koc_cli -- info --bin bins/<account>.bin --server-id <ID>
+```
+
+如果没有设置 `KOC_WS_BASE_URL`，`koc_cli` 会直接连接上游服务器，relay 不会收到任何流量。Session JSONL 和 catalog 快照会在 relay 运行期间实时 flush，无需等到退出后再查看。
+
+需要长期对当前 shell 生效时，必须 export，并确认子进程可以看到该变量。仅执行 `echo $KOC_WS_BASE_URL` 不能证明变量已经导出：
+
+```bash
+export KOC_WS_BASE_URL=ws://127.0.0.1:8787
+env | grep '^KOC_WS_BASE_URL='
+```
+
+实时解析默认开启，支持 JSON 输出以及命令、方向过滤：
+
+```bash
+cargo run --bin koc_proxy -- relay --format json --cmd 'activity_*'
+cargo run --bin koc_proxy -- relay --direction server-to-client
+```
+
+协议解析器改进后，可以重新解析历史记录或生成命令结构目录：
+
+```bash
+cargo run --bin koc_proxy -- decode --input captures/session.jsonl
+cargo run --bin koc_proxy -- catalog \
+  --input captures/session.jsonl \
+  --output captures/catalog.json
+```
+
+`--record` 保存的是 raw payload JSONL，因此文件中不会直接出现明文 `cmd`。`--decode` 表示把实时解析结果输出到 relay 终端。需要查看已保存 session 的命令时间线时使用 `koc_proxy decode`；只查看命令名可以查询 catalog JSON：
+
+```bash
+./target/release/koc_proxy decode \
+  --input capture/session.jsonl \
+  --format json \
+  --cmd '*tower*'
+
+jq -r '.commands | keys[]' capture/catalog.jsonl
+```
+
+外部 TLS MITM 可以把已经解除 TLS、WebSocket framing 和 masking 的完整消息转换为 capture-record JSONL，再通过 stdin 实时输入。`koc_proxy` 本身不负责对任意 TLS 连接签发证书：
+
+```bash
+external-adapter | cargo run --bin koc_proxy -- inspect --stream
+```
+
+Unix 下 capture 文件权限为 `0600`，且 `captures/` 已被 Git 忽略。默认输出会脱敏常见 token/session 字段，只有显式传入 `--show-sensitive` 才显示原值。原始 payload 仍可能包含角色隐私数据，不应提交到仓库。
+
+Relay 启动时会覆盖已有的普通 capture/catalog 文件，但会拒绝 symlink 和非文件路径。远程 upstream 必须使用 `wss://`，明文 `ws://` 只允许指向 loopback 开发服务器。
+
 ## 配置文件 config.yaml
 
 ```yaml
@@ -820,4 +893,3 @@ game.cmd_fire("any_command", json!({})).await?;
 | `qrcode` | 终端二维码生成 |
 | `rqrr` | 二维码图片识别 |
 | `image` | 图片解码 |
-| `urlencoding` | URL 编码 |

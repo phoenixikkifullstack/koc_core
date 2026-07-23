@@ -15,6 +15,8 @@ koc_core/
 │   ├── protocol.rs         # Game message protocol (ProtoMsg parsing/creation)
 │   ├── http_client.rs      # HTTP client (authuser / serverlist)
 │   ├── websocket.rs        # WebSocket client (heartbeat, request/response matching)
+│   ├── proxy.rs            # Realtime byte-preserving WebSocket relay
+│   ├── proxy_capture.rs    # Capture schema, decode, correlation, command catalog
 │   ├── kpi.rs              # High-level API (login, 155 game commands, daily/periodic tasks)
 │   ├── error_codes.rs      # Game error-code map + is_done_error decisions
 │   ├── config.rs           # Configuration parsing (YAML) + ConfigWatcher hot reload
@@ -25,7 +27,8 @@ koc_core/
 │   ├── logging.rs          # tracing log initialization (console + file)
 │   ├── koc_batch.rs        # [bin] Batch daily-task scheduler CLI
 │   ├── token_gen.rs        # [bin] Token/bin-file generator CLI
-│   └── koc_cli.rs          # [bin] Manual task verification CLI (verify/study/tower/evotower/monthly/car/skinc)
+│   ├── koc_cli.rs          # [bin] Manual task verification CLI (verify/study/tower/evotower/monthly/car/skinc)
+│   └── koc_proxy.rs        # [bin] Realtime protocol relay and capture inspector
 ├── run_koc_tasks.ps1       # Combined interactive task runner
 ├── run_koc_cli.ps1         # New two-level interactive menu runner
 ├── examples/
@@ -53,6 +56,9 @@ cargo build --release --bin token_gen
 
 # Build only the manual verification tool
 cargo build --release --bin koc_cli
+
+# Build only the realtime protocol proxy
+cargo build --release --bin koc_proxy
 ```
 
 ## Tool 1: token_gen - Token/Bin File Generation
@@ -465,6 +471,73 @@ Log level and output:
 - The default level is `info`; adjust it with an environment variable: `RUST_LOG=debug ./koc_batch`
 - File log directory: `logs/` (rotated daily)
 
+## Tool 4: koc_proxy - Realtime Protocol Inspection
+
+`koc_proxy` relays complete WebSocket messages without modifying their payloads and decodes a copy of each Binary message through the existing XOR/LZ4/BON stack. Decode failures never modify or block the forwarded message. The relay listens on loopback only and does not capture the authentication query from the WebSocket handshake.
+
+Start a realtime relay with optional raw recording and command-catalog output:
+
+```bash
+cargo run --bin koc_proxy -- relay \
+  --listen 127.0.0.1:8787 \
+  --decode \
+  --record captures/session.jsonl \
+  --catalog captures/catalog.json
+```
+
+Point this project's WebSocket client at the relay in another terminal. The token remains in the normal login flow and is not passed on the command line:
+
+```bash
+KOC_WS_BASE_URL=ws://127.0.0.1:8787 \
+  cargo run --bin koc_cli -- info --bin bins/<account>.bin --server-id <ID>
+```
+
+Without `KOC_WS_BASE_URL`, `koc_cli` connects directly to the upstream server and no relay records are produced. Session JSONL and catalog snapshots are flushed while the relay is running, so they can be inspected before shutdown.
+
+For a persistent shell setting, export the variable and verify that child processes can see it. `echo $KOC_WS_BASE_URL` alone does not prove it was exported:
+
+```bash
+export KOC_WS_BASE_URL=ws://127.0.0.1:8787
+env | grep '^KOC_WS_BASE_URL='
+```
+
+Realtime output is enabled by default. It supports JSON output and command/direction filtering:
+
+```bash
+cargo run --bin koc_proxy -- relay --format json --cmd 'activity_*'
+cargo run --bin koc_proxy -- relay --direction server-to-client
+```
+
+Saved records can be decoded again after the protocol parser improves:
+
+```bash
+cargo run --bin koc_proxy -- decode --input captures/session.jsonl
+cargo run --bin koc_proxy -- catalog \
+  --input captures/session.jsonl \
+  --output captures/catalog.json
+```
+
+`--record` stores raw payloads as JSONL and therefore does not contain plaintext `cmd` fields. `--decode` prints decoded events to the relay console. To inspect the command timeline from a saved session, run `koc_proxy decode`; to list command names only, query the catalog JSON:
+
+```bash
+./target/release/koc_proxy decode \
+  --input capture/session.jsonl \
+  --format json \
+  --cmd '*tower*'
+
+jq -r '.commands | keys[]' capture/catalog.jsonl
+```
+
+An external TLS MITM can stream already reassembled WebSocket messages as capture-record JSONL. `koc_proxy` does not terminate arbitrary TLS connections itself:
+
+```bash
+external-adapter | cargo run --bin koc_proxy -- inspect --stream
+```
+
+Capture files are created with mode `0600` on Unix and `captures/` is ignored by Git. Decoded output redacts common token/session identifiers unless `--show-sensitive` is explicitly supplied. Raw payloads can still contain private role data and must not be committed.
+
+Existing regular capture and catalog files are overwritten when a relay session starts. Symlinks and non-file paths are rejected. Remote upstreams must use `wss://`; plaintext `ws://` is accepted only for loopback development servers.
+
 ## Configuration File: config.yaml
 
 ```yaml
@@ -822,4 +895,3 @@ The built-in map contains 30+ English game error-code descriptions, divided into
 | `qrcode` | Terminal QR-code generation |
 | `rqrr` | QR-code image recognition |
 | `image` | Image decoding |
-| `urlencoding` | URL encoding |

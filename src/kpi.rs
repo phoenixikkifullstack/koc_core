@@ -60,7 +60,11 @@ impl GameClient {
     /// 2. send role_getroleinfo
     /// 3. calc&send randomSeed
     pub async fn login(token_json: &str) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let url = WebSocketClient::build_url(token_json);
+        let url = match std::env::var("KOC_WS_BASE_URL") {
+            Ok(base_url) => WebSocketClient::build_url_with_base(token_json, &base_url)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?,
+            Err(_) => WebSocketClient::build_url(token_json),
+        };
         info!(target: "game_client", "connecting to websocket");
         let ws = WebSocketClient::connect(&url).await?;
         info!(target: "game_client", "connected, requesting role info");
